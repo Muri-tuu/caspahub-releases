@@ -1,0 +1,51 @@
+name: Poll caspahub-business-flutter for new commits
+
+# Sibling of poll.yml, same reasoning: caspahub-business-flutter's own CI can't run
+# (billing blocked on private repos), so this public repo polls its latest commit on a
+# schedule and kicks off a real build+release here whenever it changes. Own state file
+# so this never interferes with the consumer app's poller.
+on:
+  schedule:
+    - cron: "30 * * * *" # hourly, offset 30min from poll.yml so the two never race
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check caspahub-business-flutter's latest commit
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_REPO_PAT }}
+        run: |
+          latest=$(gh api repos/ken-muritu/caspahub-business-flutter/commits/main --jq '.sha')
+          last_built=$(cat .state/last-built-sha-business.txt 2>/dev/null || echo "")
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          if [ "$latest" != "$last_built" ]; then
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Record new commit and trigger a build
+        if: steps.check.outputs.new == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ steps.check.outputs.latest }}
+        run: |
+          mkdir -p .state
+          echo "$LATEST" > .state/last-built-sha-business.txt
+          git config user.name "caspahub-releases-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add .state/last-built-sha-business.txt
+          git commit -m "Auto-build: caspahub-business-flutter@${LATEST:0:7}"
+          git push
+          gh workflow run release-business.yml --repo "${{ github.repository }}" \
+            -f ref="$LATEST" \
+            -f release_tag="business-auto-${LATEST:0:7}"
