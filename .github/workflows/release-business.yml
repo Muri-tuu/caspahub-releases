@@ -1,0 +1,127 @@
+name: Build and release CaspaHub Business app
+
+# Sibling of release.yml — same reasoning (this repo is public specifically so these
+# jobs get free/unlimited GitHub Actions minutes even while the main account's billing
+# is blocked on private repos; the actual source lives in the private
+# ken-muritu/caspahub-business-flutter repo and is pulled in below via a read-only
+# deploy token, never committed here).
+#
+# Forked rather than parameterized into release.yml: tags, asset names, and the source
+# repo all differ per app, and update_checker.dart in each app matches releases by
+# scanning tag/asset-name patterns — keeping the two apps' publish jobs textually
+# separate makes that scoping easy to verify by reading this file alone, no cross-app
+# conditionals to trace through.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch/tag/sha in caspahub-business-flutter to build"
+        required: false
+        default: "main"
+      release_tag:
+        description: "Tag to publish under (must start with business-v or business-auto- so update_checker.dart and this workflow's --prerelease check both scope correctly)"
+        required: true
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout private source
+        uses: actions/checkout@v4
+        with:
+          repository: ken-muritu/caspahub-business-flutter
+          ref: ${{ inputs.ref }}
+          token: ${{ secrets.SOURCE_REPO_PAT }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Scaffold platform folders if missing
+        run: |
+          if [ ! -d android ]; then
+            flutter create --platforms=android --org com.caspahub --project-name business_app .
+          fi
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      # Writes the CaspaHub Business mark (dark blue + amber, recolored from the
+      # consumer app's mark) into android's mipmap-*/. Config in pubspec.yaml under
+      # `flutter_launcher_icons:`.
+      - name: Generate launcher icon
+        run: dart run flutter_launcher_icons
+
+      - name: Enable R8 shrinking
+        run: python3 tool/patch_android_release.py
+
+      - name: Patch manifest for in-app updates
+        run: python3 tool/patch_android_manifest.py
+
+      # Separate keystore from the consumer app (BUSINESS_ANDROID_KEYSTORE_* secrets,
+      # not ANDROID_KEYSTORE_*) — different applicationId means there's no requirement
+      # to share one, and keeping them separate means rotating or exposing one app's
+      # signing key never touches the other's.
+      - name: Decode release keystore
+        run: echo "${{ secrets.BUSINESS_ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/app/release.keystore.p12
+
+      - name: Wire persistent release signing
+        run: python3 tool/patch_android_signing.py
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Build APK (release, split per ABI)
+        env:
+          ANDROID_KEYSTORE_PATH: release.keystore.p12
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.BUSINESS_ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.BUSINESS_ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.BUSINESS_ANDROID_KEY_PASSWORD }}
+        run: flutter build apk --release --split-per-abi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: business-apk-arm64
+          path: build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: business-apk-armv7
+          path: build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
+
+  publish:
+    needs: build-android
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      # Renamed at publish time (not just at upload-artifact) so the GitHub Release
+      # asset name itself carries the "caspahub-business-" prefix — this is the exact
+      # string update_checker.dart in each app greps for to avoid matching the other
+      # app's release.
+      - name: Rename APKs with app-scoped prefix
+        run: |
+          mv dist/business-apk-arm64/app-arm64-v8a-release.apk dist/business-apk-arm64/caspahub-business-arm64-v8a-release.apk
+          mv dist/business-apk-armv7/app-armeabi-v7a-release.apk dist/business-apk-armv7/caspahub-business-armeabi-v7a-release.apk
+
+      - name: Publish release in this (public) repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # business-auto-<sha> tags (the hourly poller) are marked --prerelease, same
+          # reasoning as the consumer app's vX.Y.Z/auto-<sha> split.
+          PRERELEASE_FLAG=""
+          if [[ "${{ inputs.release_tag }}" == business-auto-* ]]; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
+          gh release create "${{ inputs.release_tag }}" \
+            dist/business-apk-arm64/caspahub-business-arm64-v8a-release.apk \
+            dist/business-apk-armv7/caspahub-business-armeabi-v7a-release.apk \
+            --repo "${{ github.repository }}" \
+            --title "${{ inputs.release_tag }}" \
+            $PRERELEASE_FLAG \
+            --notes "Built from ken-muritu/caspahub-business-flutter@${{ inputs.ref }}. Source is private; this repo only hosts the build+release while GitHub Actions billing is blocked on the main account."
