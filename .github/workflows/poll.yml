@@ -26,7 +26,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.SOURCE_REPO_PAT }}
         run: |
-          latest=$(gh api repos/ken-muritu/caspahub-flutter/commits/main --jq '.sha')
+          latest=$(gh api repos/Muri-tuu/caspahub-flutter/commits/main --jq '.sha')
           last_built=$(cat .state/last-built-sha.txt 2>/dev/null || echo "")
           echo "latest=$latest" >> "$GITHUB_OUTPUT"
           if [ "$latest" != "$last_built" ]; then
